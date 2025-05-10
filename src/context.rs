@@ -32,6 +32,8 @@ impl ContextNotification {
     pub fn notification_path(&self) -> PathBuf {
         match self {
             ContextNotification::Lsp(LspNotification::Indexing { project, .. }) => project.clone(),
+            ContextNotification::Lsp(LspNotification::IndexingProgress(progress)) => progress.project.clone(),
+            ContextNotification::Lsp(LspNotification::IndexingPauseResume { project, .. }) => project.clone(),
             ContextNotification::Docs(DocsNotification::Indexing { project, .. }) => {
                 project.clone()
             }
@@ -49,6 +51,15 @@ impl ContextNotification {
                 format!(
                     "LSP Indexing: {}",
                     if *is_indexing { "Started" } else { "Finished" }
+                )
+            }
+            ContextNotification::Lsp(LspNotification::IndexingProgress(progress)) => {
+                format!("LSP Indexing: {}", progress.status_message())
+            }
+            ContextNotification::Lsp(LspNotification::IndexingPauseResume { should_pause, .. }) => {
+                format!(
+                    "LSP Indexing: {}",
+                    if *should_pause { "Paused" } else { "Resumed" }
                 )
             }
             ContextNotification::Docs(DocsNotification::Indexing { is_indexing, .. }) => {
@@ -111,27 +122,66 @@ impl Context {
             loop {
                 tokio::select! {
                     Ok(notification) = mcp_receiver.recv_async() => {
-                        if let Err(e) = cloned_notifier.send(ContextNotification::Mcp(notification)) {
-                            tracing::error!("Failed to send MCP notification: {}", e);
+                        if let Err(e) = cloned_notifier.try_send(ContextNotification::Mcp(notification)) {
+                            if matches!(e, flume::TrySendError::Disconnected(_)) {
+                                tracing::debug!("Channel closed when forwarding MCP notification");
+                                break; // Exit the loop if the channel is disconnected
+                            } else {
+                                tracing::error!("Failed to send MCP notification: {}", e);
+                            }
                         }
                     }
                     Ok(ref notification @ DocsNotification::Indexing { ref project, is_indexing }) = docs_receiver.recv_async() => {
-                        if let Err(e) = cloned_notifier.send(ContextNotification::Docs(notification.clone())) {
-                            tracing::error!("Failed to send docs notification: {}", e);
+                        if let Err(e) = cloned_notifier.try_send(ContextNotification::Docs(notification.clone())) {
+                            if matches!(e, flume::TrySendError::Disconnected(_)) {
+                                tracing::debug!("Channel closed when forwarding Docs notification");
+                                break; // Exit the loop if the channel is disconnected
+                            } else {
+                                tracing::error!("Failed to send docs notification: {}", e);
+                            }
                         }
                         let mut projects: RwLockWriteGuard<'_, HashMap<PathBuf, Arc<ProjectContext>>> = cloned_projects.write().await;
                         if let Some(project) = projects.get_mut(project) {
                             project.is_indexing_docs.store(is_indexing, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    Ok(ref notification @ LspNotification::Indexing { ref project, is_indexing }) = lsp_receiver.recv_async() => {
-                        if let Err(e) = cloned_notifier.send(ContextNotification::Lsp(notification.clone())) {
-                            tracing::error!("Failed to send LSP notification: {}", e);
+                    Ok(notification) = lsp_receiver.recv_async() => {
+                        if let LspNotification::IndexingProgress(ref progress) = notification {
+                            // Handle indexing progress notification
+                            if let Err(e) = cloned_notifier.try_send(ContextNotification::Lsp(notification.clone())) {
+                                if matches!(e, flume::TrySendError::Disconnected(_)) {
+                                    tracing::debug!("Channel closed when forwarding LSP progress notification");
+                                    break; // Exit the loop if the channel is disconnected
+                                } else {
+                                    tracing::error!("Failed to send LSP progress notification: {}", e);
+                                }
+                            }
+                            
+                            // Also update the atomic flag for backward compatibility
+                            let mut projects: RwLockWriteGuard<'_, HashMap<PathBuf, Arc<ProjectContext>>> = cloned_projects.write().await;
+                            if let Some(project) = projects.get_mut(&progress.project) {
+                                project.is_indexing_lsp.store(progress.is_indexing, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if let LspNotification::Indexing { ref project, is_indexing } = notification {
+                            // Handle legacy indexing notification
+                            if let Err(e) = cloned_notifier.try_send(ContextNotification::Lsp(notification.clone())) {
+                                if matches!(e, flume::TrySendError::Disconnected(_)) {
+                                    tracing::debug!("Channel closed when forwarding LSP notification");
+                                    break; // Exit the loop if the channel is disconnected
+                                } else {
+                                    tracing::error!("Failed to send LSP notification: {}", e);
+                                }
+                            }
+                            let mut projects: RwLockWriteGuard<'_, HashMap<PathBuf, Arc<ProjectContext>>> = cloned_projects.write().await;
+                            if let Some(project_ctx) = projects.get_mut(project) {
+                                project_ctx.is_indexing_lsp.store(is_indexing, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
-                        let mut projects: RwLockWriteGuard<'_, HashMap<PathBuf, Arc<ProjectContext>>> = cloned_projects.write().await;
-                        if let Some(project) = projects.get_mut(project) {
-                            project.is_indexing_lsp.store(is_indexing, std::sync::atomic::Ordering::Relaxed);
-                        }
+                    }
+                    else => {
+                        // All channels closed
+                        tracing::debug!("All message channels closed, exiting notification loop");
+                        break;
                     }
                 }
             }
@@ -164,8 +214,8 @@ impl Context {
             .replace("{{PORT}}", &port.to_string())
     }
 
-    pub fn configuration_file(&self) -> String {
-        format!("~/{}", CONFIGURATION_FILE)
+    pub fn configuration_file(&self, project_root: &Path) -> String {
+        PathBuf::from(project_root).join(CONFIGURATION_FILE).to_string_lossy().into_owned()
     }
 
     pub async fn project_descriptions(&self) -> Vec<ProjectDescription> {
@@ -182,18 +232,17 @@ impl Context {
         Ok(())
     }
 
-    fn config_path(&self) -> PathBuf {
-        let parsed = shellexpand::tilde(&self.configuration_file()).to_string();
-        PathBuf::from(parsed)
+    fn config_path(&self, project_root: &Path) -> PathBuf {
+        PathBuf::from(project_root).join(CONFIGURATION_FILE)
     }
 
-    async fn write_config(&self) -> Result<()> {
+    async fn write_config(&self, project_root: &Path) -> Result<()> {
         let projects_map = self.projects.read().await;
         let projects_to_save: Vec<SerProject> = projects_map
             .values()
             .map(|pc| &pc.project)
             .map(|p| SerProject {
-                root: p.root().to_string_lossy().to_string(),
+                root: p.root().to_string_lossy().to_string().replace('\\', "/"),
                 ignore_crates: p.ignore_crates().to_vec(),
             })
             .collect();
@@ -201,7 +250,7 @@ impl Context {
             projects: projects_to_save,
         };
 
-        let config_path = self.config_path();
+        let config_path = self.config_path(project_root);
 
         let toml_string = toml::to_string_pretty(&config)?;
         if let Some(parent) = config_path.parent() {
@@ -212,8 +261,8 @@ impl Context {
         Ok(())
     }
 
-    pub async fn load_config(&self) -> Result<()> {
-        let config_path = self.config_path();
+    pub async fn load_config(&self, project_root: &Path) -> Result<()> {
+        let config_path = self.config_path(project_root);
 
         if !config_path.exists() {
             tracing::warn!(
@@ -239,21 +288,37 @@ impl Context {
             return Ok(());
         }
 
+        // First try to parse normally
         let loaded_config: SerConfig = match toml::from_str(&toml_string) {
             Ok(config) => config,
             Err(e) => {
-                tracing::error!(
-                    "Failed to parse TOML from config file {:?}: {}",
+                tracing::warn!(
+                    "Failed to parse TOML from config file {:?}: {}. Attempting to fix Windows paths...",
                     config_path,
                     e
                 );
-                // Don't return error here, maybe the file is corrupt but we can continue
-                return Ok(());
+                
+                // Try to fix Windows paths by escaping backslashes
+                // This handles manually edited config files with Windows paths
+                let fixed_toml = toml_string.replace("\\", "\\\\");
+                match toml::from_str(&fixed_toml) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to parse TOML after fixing paths in config file {:?}: {}",
+                            config_path,
+                            e
+                        );
+                        // Don't return error here, maybe the file is corrupt but we can continue
+                        return Ok(());
+                    }
+                }
             }
         };
-
+        
         for project in loaded_config.projects {
             let project = Project {
+                // PathBuf automatically handles forward slashes correctly on all platforms
                 root: PathBuf::from(&project.root),
                 ignore_crates: project.ignore_crates,
             };
@@ -292,33 +357,84 @@ impl Context {
     /// Add a new project to the context
     pub async fn add_project(&self, project: Project) -> Result<()> {
         let root = project.root().clone();
-        let lsp = RustAnalyzerLsp::new(&project, self.lsp_sender.clone()).await?;
-        let docs = Docs::new(project.clone(), self.docs_sender.clone())?;
-        docs.update_index().await?;
-        let cargo_remote = CargoRemote::new(project.clone());
-        let project_context = Arc::new(ProjectContext {
+        
+        // Validate the path exists and is valid
+        if !root.exists() {
+            return Err(anyhow::anyhow!("Project root does not exist: {:?}", root));
+        }
+        
+        // Check if it's already in the map
+        if self.projects.read().await.contains_key(&root) {
+            return Err(anyhow::anyhow!("Project already exists"));
+        }
+
+        // Try to create the LSP client, with helpful Windows error messages
+        let lsp = match RustAnalyzerLsp::new(&project, self.lsp_sender.clone()).await {
+            Ok(lsp) => lsp,
+            Err(e) => {
+                if cfg!(windows) {
+                    tracing::error!("Failed to initialize LSP for Windows path: {:?}", root);
+                    tracing::error!("Windows paths may need special handling: {}", e);
+                }
+                return Err(anyhow::anyhow!("Failed to initialize LSP: {}", e));
+            }
+        };
+
+        // Create the docs client - but don't fail if it can't be created
+        let docs = match Docs::new(&project, self.docs_sender.clone()) {
+            Ok(docs) => docs,
+            Err(e) => {
+                // Create a default Docs instance to avoid failing the entire project addition
+                tracing::warn!("Failed to initialize Docs client: {}. Creating empty docs client.", e);
+                
+                // Try to create cache dir if needed
+                let cache_dir = project.cache_dir();
+                if !cache_dir.exists() {
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                }
+                
+                // Create default docs to avoid stopping project setup
+                match Docs::new_empty(&project, self.docs_sender.clone()) {
+                    Ok(docs) => docs,
+                    Err(e2) => {
+                        tracing::error!("Failed to create fallback docs client: {}", e2);
+                        return Err(anyhow::anyhow!("Failed to initialize Docs client: {}", e));
+                    }
+                }
+            }
+        };
+
+        let cargo_remote = CargoRemote::default();
+
+        // Insert the project context
+        let context = Arc::new(ProjectContext {
             project,
             lsp,
             docs,
             cargo_remote,
-            is_indexing_lsp: AtomicBool::new(true),
-            is_indexing_docs: AtomicBool::new(true),
+            is_indexing_lsp: AtomicBool::new(false),
+            is_indexing_docs: AtomicBool::new(false),
         });
 
-        let mut projects_map = self.projects.write().await;
-        projects_map.insert(root.clone(), project_context);
-        drop(projects_map);
+        self.projects.write().await.insert(root.clone(), context);
 
-        self.request_project_descriptions();
+        // Send a notification that the project has been added
+        if let Err(e) = self.notifier.try_send(ContextNotification::ProjectAdded(root.clone())) {
+            if matches!(e, flume::TrySendError::Disconnected(_)) {
+                tracing::debug!("Channel closed when sending project added notification");
+            } else {
+                tracing::error!("Failed to send notification: {}", e);
+                return Err(anyhow::anyhow!("Failed to send notification: {}", e));
+            }
+        }
 
         // Write config after successfully adding
-        if let Err(e) = self.write_config().await {
+        if let Err(e) = self.write_config(&root).await {
             tracing::error!("Failed to write config after adding project: {}", e);
         }
 
-        if let Err(e) = self.notifier.send(ContextNotification::ProjectAdded(root)) {
-            tracing::error!("Failed to send project added notification: {}", e);
-        }
+        // Send a notification with the updated project descriptions
+        self.request_project_descriptions();
 
         Ok(())
     }
@@ -331,14 +447,15 @@ impl Context {
         };
 
         if project.is_some() {
-            if let Err(e) = self
-                .notifier
-                .send(ContextNotification::ProjectRemoved(root.clone()))
-            {
-                tracing::error!("Failed to send project removed notification: {}", e);
+            if let Err(e) = self.notifier.try_send(ContextNotification::ProjectRemoved(root.clone())) {
+                if matches!(e, flume::TrySendError::Disconnected(_)) {
+                    tracing::debug!("Channel closed when sending project removed notification");
+                } else {
+                    tracing::error!("Failed to send project removed notification: {}", e);
+                }
             }
             // Write config after successfully removing
-            if let Err(e) = self.write_config().await {
+            if let Err(e) = self.write_config(root).await {
                 tracing::error!("Failed to write config after removing project: {}", e);
             }
         }
@@ -351,10 +468,14 @@ impl Context {
         tokio::spawn(async move {
             let projects_map = projects.read().await;
             let project_descriptions = project_descriptions(&projects_map).await;
-            if let Err(e) = notifier.send(ContextNotification::ProjectDescriptions(
+            if let Err(e) = notifier.try_send(ContextNotification::ProjectDescriptions(
                 project_descriptions,
             )) {
-                tracing::error!("Failed to send project descriptions: {}", e);
+                if matches!(e, flume::TrySendError::Disconnected(_)) {
+                    tracing::debug!("Channel closed when sending project descriptions");
+                } else {
+                    tracing::error!("Failed to send project descriptions: {}", e);
+                }
             }
         });
     }
@@ -386,16 +507,40 @@ impl Context {
         None
     }
 
+    /// Forces doc indexing for the given project
     pub async fn force_index_docs(&self, project: &PathBuf) -> Result<()> {
-        let Some(project_context) = self.get_project(project).await else {
+        let Some(_project_context) = self.get_project(project).await else {
             return Err(anyhow::anyhow!("Project not found"));
         };
-        let oldval = project_context
+        let oldval = _project_context
             .is_indexing_docs
             .load(std::sync::atomic::Ordering::Relaxed);
-        project_context
+        _project_context
             .is_indexing_docs
             .store(!oldval, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Toggles pause/resume for the LSP indexing process
+    pub async fn toggle_indexing_pause(&self, project: &PathBuf, should_pause: bool) -> Result<()> {
+        // Get the project context
+        let Some(_project_context) = self.get_project(project).await else {
+            return Err(anyhow::anyhow!("Project not found"));
+        };
+        
+        // Send the pause/resume notification
+        self.lsp_sender.send(LspNotification::IndexingPauseResume {
+            project: project.clone(),
+            should_pause,
+        })?;
+        
+        // Log the action
+        tracing::info!(
+            "Sent indexing {} command for project {:?}",
+            if should_pause { "pause" } else { "resume" },
+            project
+        );
+        
         Ok(())
     }
 
@@ -433,6 +578,7 @@ struct SerConfig {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SerProject {
+    // Paths are stored with forward slashes for cross-platform compatibility
     root: String,
     ignore_crates: Vec<String>,
 }

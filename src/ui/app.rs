@@ -10,6 +10,7 @@ use flume::Receiver;
 use crate::{
     context::{Context, ContextNotification},
     project::Project,
+    lsp::{LspNotification, IndexingProgress},
 };
 
 #[derive(Clone, Debug)]
@@ -44,6 +45,7 @@ pub struct App {
     selected_sidebar_tab: SidebarTab,
     selected_event: Option<TimestampedEvent>,
     project_descriptions: Vec<ProjectDescription>,
+    indexing_progress: HashMap<PathBuf, IndexingProgress>,
 }
 
 impl App {
@@ -61,6 +63,7 @@ impl App {
             selected_sidebar_tab: SidebarTab::Projects,
             selected_event: None,
             project_descriptions,
+            indexing_progress: HashMap::new(),
         }
     }
 
@@ -77,25 +80,68 @@ impl App {
             // If its not a new project notification, request projects
             self.context.request_project_descriptions();
 
-            // If its a lsp, ignore because there's a lot of them
-            if matches!(notification, ContextNotification::Lsp(_)) {
+            // Handle detailed indexing progress notifications
+            if let ContextNotification::Lsp(LspNotification::IndexingProgress(progress)) = &notification {
                 has_new_events = true;
+                tracing::debug!("Received detailed indexing progress: {:?}", progress);
+                
+                // Store the progress information
+                self.indexing_progress.insert(progress.project.clone(), progress.clone());
+                
+                // Also add it to events for the event list
+                let project_path = notification.notification_path();
+                let Some(project) = find_root_project(&project_path, &self.project_descriptions) else {
+                    tracing::error!("Project not found: {:?}", project_path);
+                    continue;
+                };
+                let project_name = project.file_name().unwrap().to_string_lossy().to_string();
+                let timestamped_event = TimestampedEvent(chrono::Utc::now(), notification);
+                self.events
+                    .entry(project_name)
+                    .or_default()
+                    .push(timestamped_event);
+                
                 continue;
             }
-            // Otherwise, we have a new event
-            has_new_events = true;
-            tracing::debug!("Received notification: {:?}", notification);
-            let project_path = notification.notification_path();
-            let Some(project) = find_root_project(&project_path, &self.project_descriptions) else {
-                tracing::error!("Project not found: {:?}", project_path);
-                continue;
-            };
-            let project_name = project.file_name().unwrap().to_string_lossy().to_string();
-            let timestamped_event = TimestampedEvent(Utc::now(), notification);
-            self.events
-                .entry(project_name)
-                .or_default()
-                .push(timestamped_event);
+            
+            // Filter out high-volume LSP notifications but allow indexing notifications through
+            if let ContextNotification::Lsp(lsp) = &notification {
+                // Let indexing notifications through to update the UI spinner
+                if matches!(lsp, LspNotification::Indexing { .. }) {
+                    has_new_events = true;
+                    tracing::debug!("Received LSP indexing notification: {:?}", notification);
+                    let project_path = notification.notification_path();
+                    let Some(project) = find_root_project(&project_path, &self.project_descriptions) else {
+                        tracing::error!("Project not found: {:?}", project_path);
+                        continue;
+                    };
+                    let project_name = project.file_name().unwrap().to_string_lossy().to_string();
+                    let timestamped_event = TimestampedEvent(chrono::Utc::now(), notification);
+                    self.events
+                        .entry(project_name)
+                        .or_default()
+                        .push(timestamped_event);
+                } else {
+                    // Filter out other high-volume LSP notifications
+                    has_new_events = true;
+                    continue;
+                }
+            } else {
+                // Otherwise, we have a new event
+                has_new_events = true;
+                tracing::debug!("Received notification: {:?}", notification);
+                let project_path = notification.notification_path();
+                let Some(project) = find_root_project(&project_path, &self.project_descriptions) else {
+                    tracing::error!("Project not found: {:?}", project_path);
+                    continue;
+                };
+                let project_name = project.file_name().unwrap().to_string_lossy().to_string();
+                let timestamped_event = TimestampedEvent(chrono::Utc::now(), notification);
+                self.events
+                    .entry(project_name)
+                    .or_default()
+                    .push(timestamped_event);
+            }
         }
         has_new_events
     }
@@ -128,7 +174,41 @@ impl App {
                 let is_spinning = project.is_indexing_lsp || project.is_indexing_docs;
                 let is_selected = selected_path.as_ref() == Some(&project.root);
 
-                let cell = ListCell::new(&project.name, is_selected, is_spinning);
+                // Get detailed progress information if available
+                let status_text = if let Some(progress) = self.indexing_progress.get(&project.root) {
+                    if progress.is_indexing {
+                        // Format a detailed status message
+                        let mut text = project.name.clone();
+                        
+                        // Add file count if available
+                        if let Some(files) = progress.estimated_files {
+                            text.push_str(&format!(" ({} files", files));
+                            
+                            // Add crate count if available
+                            if let Some(crates) = progress.crate_count {
+                                text.push_str(&format!(", {} crates", crates));
+                            }
+                            
+                            text.push(')');
+                        }
+                        
+                        // Add the progress message
+                        if let Some(ref msg) = progress.status_message {
+                            text.push_str(&format!("\n{}", msg));
+                        }
+                        
+                        // Add elapsed time
+                        text.push_str(&format!(" - {}", progress.elapsed_time()));
+                        
+                        text
+                    } else {
+                        project.name.clone()
+                    }
+                } else {
+                    project.name.clone()
+                };
+
+                let cell = ListCell::new(&status_text, is_selected, is_spinning);
                 let response = cell.show(ui);
 
                 if response.clicked() {
@@ -144,15 +224,45 @@ impl App {
                     tracing::debug!("Adding project: {:?}", path_buf);
 
                     let context = self.context.clone();
+                    
                     tokio::spawn(async move {
-                        if let Err(e) = context
-                            .add_project(Project {
-                                root: path_buf,
-                                ignore_crates: vec![],
-                            })
-                            .await
-                        {
+                        // Extra validation before creating Project
+                        if !path_buf.exists() {
+                            tracing::error!("Selected path doesn't exist: {:?}", path_buf);
+                            return;
+                        }
+                        
+                        // Try to create the .docs-cache directory before adding the project
+                        // This helps verify we have write permissions to the folder
+                        let cache_dir = path_buf.join(".docs-cache");
+                        if !cache_dir.exists() {
+                            if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                                tracing::error!("Failed to create .docs-cache directory: {}", e);
+                                tracing::error!("This may indicate permission issues with the selected folder.");
+                                return;
+                            }
+                        }
+
+                        // Create Project struct directly but with additional validation
+                        let project = Project {
+                            root: path_buf.clone(),
+                            ignore_crates: vec![],
+                        };
+
+                        if let Err(e) = context.add_project(project).await {
                             tracing::error!("Failed to add project: {}", e);
+                            
+                            // More detailed Windows error messages
+                            if cfg!(windows) {
+                                if e.to_string().contains("find the file specified") {
+                                    tracing::error!("Windows path error: Make sure the folder exists and has no special characters");
+                                    tracing::error!("You selected: {:?}", path_buf);
+                                    tracing::error!("Try selecting a folder with a simpler path and no special characters");
+                                } else if e.to_string().contains("Failed to initialize Docs") {
+                                    tracing::error!("Failed to initialize documentation system");
+                                    tracing::error!("Check if you have write permissions to create the .docs-cache folder");
+                                }
+                            }
                         } else {
                             tracing::debug!("Project added successfully.");
                         }
@@ -177,7 +287,11 @@ impl App {
 
     fn draw_info_tab(&mut self, ui: &mut Ui) {
         let (host, port) = self.context.address_information();
-        let config_file = self.context.configuration_file();
+        
+        // Use current directory for config file path
+        let current_dir = std::env::current_dir().unwrap_or_default();
+        let config_file = self.context.configuration_file(&current_dir);
+        
         ui.label(format!("Address: {}", host));
         ui.label(format!("Port: {}", port));
 
@@ -191,13 +305,31 @@ impl App {
             ui.small("Place this in your .cursor/mcp.json file");
 
             if ui.button("Open Conf").clicked() {
-                if let Err(e) = open::that(shellexpand::tilde(&config_file).to_string()) {
+                let path = std::path::Path::new(&config_file);
+                
+                // Create parent directory if it doesn't exist
+                if let Some(parent) = path.parent() {
+                    if !parent.exists() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            tracing::error!("Failed to create config directory: {}", e);
+                        }
+                    }
+                }
+                
+                // Try to create an empty file if it doesn't exist
+                if !path.exists() {
+                    if let Err(e) = std::fs::write(path, "") {
+                        tracing::error!("Failed to create empty config file: {}", e);
+                    }
+                }
+                
+                // Now try to open it
+                if let Err(e) = open::that(&config_file) {
                     tracing::error!("Failed to open config file: {}", e);
                 }
             }
             if ui.button("Copy Conf Path").clicked() {
-                let path = shellexpand::tilde(&config_file).to_string();
-                ui.ctx().copy_text(path);
+                ui.ctx().copy_text(config_file.clone());
             }
             ui.small(&config_file);
             ui.small("To manually edit projects");
@@ -206,7 +338,7 @@ impl App {
 
     fn draw_main_area(&mut self, ui: &mut Ui, project_descriptions: &[ProjectDescription]) {
         if let Some(selected_root) = &self.selected_project {
-            let config_path = PathBuf::from(selected_root).join(".cursor/mcp.json");
+            let config_path = PathBuf::from(selected_root).join(".cursor").join("mcp.json");
             if let Some(project) = project_descriptions
                 .iter()
                 .find(|p| p.root == *selected_root)
@@ -247,8 +379,39 @@ impl App {
                         }
                         ui.add_space(10.0);
                         if project.is_indexing_lsp {
-                            ui.add(egui::Spinner::new());
-                            ui.label("Indexing LSP...");
+                            ui.horizontal(|ui| {
+                                ui.add(egui::Spinner::new());
+                                
+                                // Show detailed progress information if available
+                                if let Some(progress) = self.indexing_progress.get(&project.root) {
+                                    // Show pause/resume button
+                                    if progress.is_paused {
+                                        if ui.button("▶ Resume").clicked() {
+                                            let context = self.context.clone();
+                                            let project_root = project.root.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = context.toggle_indexing_pause(&project_root, false).await {
+                                                    tracing::error!("Failed to resume indexing: {}", e);
+                                                }
+                                            });
+                                        }
+                                    } else {
+                                        if ui.button("⏸ Pause").clicked() {
+                                            let context = self.context.clone();
+                                            let project_root = project.root.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = context.toggle_indexing_pause(&project_root, true).await {
+                                                    tracing::error!("Failed to pause indexing: {}", e);
+                                                }
+                                            });
+                                        }
+                                    }
+                                    
+                                    ui.label(progress.status_message());
+                                } else {
+                                    ui.label("Indexing LSP...");
+                                }
+                            });
                         }
                         ui.add_space(10.0);
                         if project.is_indexing_docs {
@@ -273,11 +436,14 @@ impl App {
                                         {
                                             let mut event_to_select = None;
                                             for event_tuple in project_events.iter().rev() {
-                                                if matches!(
-                                                    event_tuple.1,
-                                                    ContextNotification::Lsp(_)
-                                                ) {
-                                                    continue;
+                                                // Only filter out non-indexing LSP notifications
+                                                if let ContextNotification::Lsp(lsp) = &event_tuple.1 {
+                                                    if !matches!(lsp, 
+                                                        crate::lsp::LspNotification::Indexing { .. } | 
+                                                        crate::lsp::LspNotification::IndexingProgress(_)
+                                                    ) {
+                                                        continue;
+                                                    }
                                                 }
                                                 let TimestampedEvent(timestamp, event) =
                                                     event_tuple;
@@ -504,8 +670,9 @@ fn find_root_project(mut path: &Path, projects: &[ProjectDescription]) -> Option
 }
 
 fn create_mcp_configuration_file(path: &Path, contents: String) -> anyhow::Result<()> {
-    let config_path = PathBuf::from(path).join(".cursor/mcp.json");
-    std::fs::create_dir_all(&config_path)?;
+    let cursor_dir = PathBuf::from(path).join(".cursor");
+    std::fs::create_dir_all(&cursor_dir)?;
+    let config_path = cursor_dir.join("mcp.json");
     std::fs::write(config_path, contents)?;
     Ok(())
 }
