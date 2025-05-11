@@ -490,15 +490,48 @@ impl Context {
     /// Will traverse up the path hierarchy until it finds a matching project root
     pub async fn get_project_by_path(&self, path: &Path) -> Option<Arc<ProjectContext>> {
         let mut current_path = path.to_path_buf();
-
         let projects_map = self.projects.read().await;
 
+        #[cfg(windows)]
+        {
+            // Try to find project using case-insensitive path comparison first
+            for (project_root, project) in projects_map.iter() {
+                if paths_equal_ignore_case(&current_path, project_root) {
+                    return Some(project.clone());
+                }
+                
+                // Also try with normalized slash direction
+                if let Some(result) = try_match_windows_path(&current_path, project_root, project) {
+                    return Some(result);
+                }
+            }
+        }
+
+        // Standard lookup for exact match
         if let Some(project) = projects_map.get(&current_path) {
             return Some(project.clone());
         }
 
+        // Traverse up the path hierarchy
         while let Some(parent) = current_path.parent() {
             current_path = parent.to_path_buf();
+            
+            #[cfg(windows)]
+            {
+                // Try case-insensitive matches at each parent level
+                for (project_root, project) in projects_map.iter() {
+                    if paths_equal_ignore_case(&current_path, project_root) {
+                        return Some(project.clone());
+                    }
+                    
+                    // Also try with normalized slash direction
+                    if let Some(result) = try_match_windows_path(&current_path, project_root, project) {
+                        return Some(result);
+                    }
+                }
+            }
+            
+            // Standard exact match
             if let Some(project) = projects_map.get(&current_path) {
                 return Some(project.clone());
             }
@@ -605,4 +638,30 @@ async fn project_descriptions(
                 .load(std::sync::atomic::Ordering::Relaxed),
         })
         .collect()
+}
+
+#[cfg(windows)]
+fn paths_equal_ignore_case(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+}
+
+#[cfg(windows)]
+fn try_match_windows_path(path: &Path, project_root: &Path, project: &Arc<ProjectContext>) -> Option<Arc<ProjectContext>> {
+    // Try with forward slashes
+    let path_fwd = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let root_fwd = project_root.to_string_lossy().replace('\\', "/").to_lowercase();
+    
+    if path_fwd == root_fwd {
+        return Some(project.clone());
+    }
+    
+    // Try with backslashes
+    let path_back = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let root_back = project_root.to_string_lossy().replace('/', "\\").to_lowercase();
+    
+    if path_back == root_back {
+        return Some(project.clone());
+    }
+    
+    None
 }

@@ -2,6 +2,8 @@ use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use toml::Value;
+#[cfg(windows)]
+use dunce;
 
 #[derive(Debug, PartialEq)]
 pub enum RustSymbol<'a> {
@@ -66,24 +68,43 @@ pub fn get_cargo_dependencies(project: &crate::project::Project) -> Result<Vec<(
         return Ok(Vec::new());
     }
     
+    // Try to get a canonical path using dunce (which avoids UNC paths on Windows)
+    #[cfg(windows)]
+    let cargo_path = dunce::canonicalize(&cargo_path).unwrap_or_else(|e| {
+        tracing::warn!("Failed to canonicalize Cargo.toml path: {}, using original path", e);
+        cargo_path
+    });
+    
+    // Log the final path we're trying to read
+    tracing::debug!("Reading Cargo.toml from: {:?}", cargo_path);
+    
     // Read the Cargo.toml file with better error handling
-    let cargo_content = match fs::read_to_string(&cargo_path) {
+    let cargo_content = match std::fs::read_to_string(&cargo_path) {
         Ok(content) => content,
         Err(e) => {
             tracing::error!("Failed to read Cargo.toml at {:?}: {}", cargo_path, e);
             if cfg!(windows) {
-                tracing::error!("Windows path issue: Check if path contains special characters or spaces");
+                tracing::error!("Windows path issue detected. Path details:");
+                tracing::error!("  Absolute form: {:?}", cargo_path.as_os_str());
+                tracing::error!("  Unicode form: {}", cargo_path.to_string_lossy());
+                tracing::error!("Check if path contains special characters or spaces");
             }
             // Return empty dependencies instead of error
             return Ok(Vec::new());
         }
     };
     
+    // Log the content length to help diagnose if file was actually read
+    tracing::debug!("Cargo.toml content length: {} bytes", cargo_content.len());
+    
     // Parse the TOML with better error handling
     let cargo_toml: Value = match toml::from_str(&cargo_content) {
         Ok(parsed) => parsed,
         Err(e) => {
             tracing::error!("Failed to parse Cargo.toml: {}", e);
+            if let Some(content_preview) = cargo_content.get(0..100) {
+                tracing::error!("Content preview: {}", content_preview);
+            }
             // Return empty dependencies instead of error
             return Ok(Vec::new());
         }

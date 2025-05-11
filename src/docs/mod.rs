@@ -154,7 +154,10 @@ impl Docs {
                 "No dependencies found. Please update the docs cache first"
             ));
         }
-        let markdown = index.markdown_docs(crate_name).unwrap();
+        
+        let markdown = index.markdown_docs(crate_name)
+            .ok_or_else(|| anyhow::anyhow!("No documentation found for crate: {}", crate_name))?;
+            
         Ok(markdown)
     }
 

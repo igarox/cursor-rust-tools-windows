@@ -5,6 +5,8 @@ use crate::context::{Context, ProjectContext};
 use anyhow::Result;
 use lsp_types::Position;
 use mcp_core::types::{CallToolRequest, CallToolResponse, ToolResponseContent};
+#[cfg(windows)]
+use dunce;
 
 pub fn error_response(message: &str) -> CallToolResponse {
     CallToolResponse {
@@ -66,15 +68,53 @@ pub async fn get_info_from_request(
     request: &CallToolRequest,
 ) -> Result<(Arc<ProjectContext>, String, PathBuf), CallToolResponse> {
     let file = request.get_file()?;
+    
+    // Normalize Windows paths by replacing backslashes with forward slashes
+    #[cfg(windows)]
+    let file = file.replace('\\', "/");
+    
+    tracing::debug!("Processing file path: {}", file);
     let absolute_path = PathBuf::from(file.clone());
+    
+    // Try to use dunce to get a canonical path without UNC prefixes
+    #[cfg(windows)]
+    let absolute_path = dunce::canonicalize(&absolute_path)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to canonicalize path: {}, error: {}", file, e);
+            absolute_path
+        });
+    
     let Some(project) = context.get_project_by_path(&absolute_path).await else {
-        return Err(error_response("No project found for file {file}"));
+        #[cfg(windows)]
+        {
+            // Windows-specific error with helpful information
+            tracing::error!("Path format issue on Windows: {}", file);
+            return Err(error_response(&format!(
+                "No project found for file {}. On Windows, try using forward slashes in paths.",
+                file
+            )));
+        }
+        
+        #[cfg(not(windows))]
+        return Err(error_response(&format!("No project found for file {}", file)));
     };
 
-    let relative_path = project
-        .project
-        .relative_path(&file)
-        .map_err(|e| error_response(&e))?;
+    let relative_path = match project.project.relative_path(&file) {
+        Ok(path) => path,
+        Err(e) => {
+            #[cfg(windows)]
+            {
+                tracing::error!("Windows path resolution error: {}", e);
+                return Err(error_response(&format!(
+                    "{}. Windows paths may need normalization. Try using forward slashes.",
+                    e
+                )));
+            }
+            
+            #[cfg(not(windows))]
+            return Err(error_response(&e));
+        }
+    };
 
     Ok((project, relative_path, absolute_path))
 }

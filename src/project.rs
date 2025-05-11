@@ -80,6 +80,61 @@ impl Project {
     /// Returns an error if the path is not within the project root.
     pub fn relative_path(&self, absolute_path: impl AsRef<Path>) -> Result<String, String> {
         let absolute_path = absolute_path.as_ref();
+        
+        #[cfg(windows)]
+        {
+            // Get string representations for comparison
+            let root_str = self.root.to_string_lossy();
+            let abs_str = absolute_path.to_string_lossy();
+            
+            // Try various path formats for Windows
+            let formats_to_try = [
+                // Original paths
+                (root_str.to_string(), abs_str.to_string()),
+                // Forward slashes
+                (root_str.replace('\\', "/"), abs_str.replace('\\', "/")),
+                // Backslashes
+                (root_str.replace('/', "\\"), abs_str.replace('/', "\\")),
+                // Lowercase versions
+                (root_str.to_lowercase(), abs_str.to_lowercase()),
+                // Lowercase + forward slashes
+                (root_str.to_lowercase().replace('\\', "/"), abs_str.to_lowercase().replace('\\', "/")),
+                // Lowercase + backslashes
+                (root_str.to_lowercase().replace('/', "\\"), abs_str.to_lowercase().replace('/', "\\")),
+            ];
+            
+            for (root_fmt, abs_fmt) in formats_to_try.iter() {
+                if abs_fmt.starts_with(root_fmt) {
+                    // Calculate the relative path by getting the substring after the root
+                    let offset = root_fmt.len();
+                    let rel_path = if offset < abs_fmt.len() {
+                        let mut rel = abs_fmt[offset..].to_string();
+                        // Remove any leading slashes
+                        if rel.starts_with('\\') || rel.starts_with('/') {
+                            rel = rel[1..].to_string();
+                        }
+                        rel
+                    } else {
+                        // If the path is exactly the root, return empty string
+                        "".to_string()
+                    };
+                    
+                    tracing::debug!("Windows path resolution: root={}, abs={}, rel={}", 
+                                   root_fmt, abs_fmt, rel_path);
+                    return Ok(rel_path);
+                }
+            }
+            
+            // Advanced logging for debugging path resolution issues
+            tracing::warn!("Windows path resolution failed:");
+            tracing::warn!("  Project root: {:?}", self.root);
+            tracing::warn!("  Absolute path: {:?}", absolute_path);
+            for (i, (root_fmt, abs_fmt)) in formats_to_try.iter().enumerate() {
+                tracing::warn!("  Attempt {}: {} vs {}", i+1, root_fmt, abs_fmt);
+            }
+        }
+        
+        // Non-Windows or fallback path using strip_prefix
         absolute_path
             .strip_prefix(&self.root)
             .map(|p| p.to_string_lossy().to_string())
