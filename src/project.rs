@@ -83,24 +83,30 @@ impl Project {
         
         #[cfg(windows)]
         {
-            // Get string representations for comparison
-            let root_str = self.root.to_string_lossy();
-            let abs_str = absolute_path.to_string_lossy();
+            // On Windows, we need to handle path formats with both types of slashes
+            // Get lowercase string representations for case-insensitive comparison
+            let root_str = self.root.to_string_lossy().to_string();
+            let abs_str = absolute_path.to_string_lossy().to_string();
             
-            // Try various path formats for Windows
-            let formats_to_try = [
-                // Original paths
-                (root_str.to_string(), abs_str.to_string()),
-                // Forward slashes
-                (root_str.replace('\\', "/"), abs_str.replace('\\', "/")),
-                // Backslashes
-                (root_str.replace('/', "\\"), abs_str.replace('/', "\\")),
-                // Lowercase versions
+            // Try different path format combinations
+            let formats_to_try = vec![
+                // Forward slashes for both
+                (root_str.replace('\\', "/").to_lowercase(), abs_str.replace('\\', "/").to_lowercase()),
+                // Backslashes for both
+                (root_str.replace('/', "\\").to_lowercase(), abs_str.replace('/', "\\").to_lowercase()),
+                // Original formats but lowercase
                 (root_str.to_lowercase(), abs_str.to_lowercase()),
-                // Lowercase + forward slashes
-                (root_str.to_lowercase().replace('\\', "/"), abs_str.to_lowercase().replace('\\', "/")),
-                // Lowercase + backslashes
-                (root_str.to_lowercase().replace('/', "\\"), abs_str.to_lowercase().replace('/', "\\")),
+                // Try canonicalized paths if possible
+                (match dunce::canonicalize(&self.root) {
+                    Ok(p) => p.to_string_lossy().to_lowercase(),
+                    Err(_) => root_str.to_lowercase(),
+                }, match dunce::canonicalize(absolute_path) {
+                    Ok(p) => p.to_string_lossy().to_lowercase(),
+                    Err(_) => abs_str.to_lowercase(),
+                }),
+                // Mixed slashes variants (just to be thorough)
+                (root_str.to_lowercase(), abs_str.replace('\\', "/").to_lowercase()),
+                (root_str.replace('\\', "/").to_lowercase(), abs_str.to_lowercase()),
             ];
             
             for (root_fmt, abs_fmt) in formats_to_try.iter() {
@@ -125,6 +131,12 @@ impl Project {
                 }
             }
             
+            // Special case: If we're dealing with an external Cargo.toml file directly
+            if absolute_path.file_name().map_or(false, |name| name.to_string_lossy() == "Cargo.toml") {
+                tracing::debug!("Special case handling for external Cargo.toml file");
+                return Ok("Cargo.toml".to_string());
+            }
+            
             // Advanced logging for debugging path resolution issues
             tracing::warn!("Windows path resolution failed:");
             tracing::warn!("  Project root: {:?}", self.root);
@@ -139,6 +151,12 @@ impl Project {
             .strip_prefix(&self.root)
             .map(|p| p.to_string_lossy().to_string())
             .map_err(|_| {
+                // If strip_prefix fails but the path has a file name, use just the file name as a last resort
+                if let Some(file_name) = absolute_path.file_name() {
+                    tracing::warn!("Falling back to just using file name: {:?}", file_name);
+                    return file_name.to_string_lossy().to_string();
+                }
+                
                 format!(
                     "Path {:?} is not inside project root {:?}",
                     absolute_path, self.root

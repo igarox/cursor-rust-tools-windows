@@ -539,6 +539,66 @@ impl Context {
 
         None
     }
+    
+    /// Try to get an existing project or register a new external project dynamically
+    /// This is useful for handling paths that point to projects outside the current workspace
+    pub async fn get_or_register_external_project(&self, path: &Path) -> Option<Arc<ProjectContext>> {
+        // First check if we already have this project registered
+        if let Some(project) = self.get_project_by_path(path).await {
+            return Some(project);
+        }
+        
+        // If not, try to find a project root by looking for a Cargo.toml file
+        let mut current_path = path.to_path_buf();
+        if current_path.is_file() {
+            // If path is a file, start with its parent directory
+            if let Some(parent) = current_path.parent() {
+                current_path = parent.to_path_buf();
+            } else {
+                return None;
+            }
+        }
+        
+        // Try to find a Cargo.toml file in the current directory or any parent directory
+        while current_path.exists() {
+            let cargo_toml = current_path.join("Cargo.toml");
+            if cargo_toml.exists() {
+                // Found a Cargo.toml file, try to register this as a new project
+                tracing::info!("Found Cargo.toml at {:?}, trying to register as external project", cargo_toml);
+                
+                match Project::new(&current_path) {
+                    Ok(project) => {
+                        // Try adding this project
+                        match self.add_project(project).await {
+                            Ok(()) => {
+                                tracing::info!("Successfully registered external project at {:?}", current_path);
+                                return self.get_project_by_path(&current_path).await;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to add external project: {}", e);
+                                return None;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create project for {:?}: {}", current_path, e);
+                        return None;
+                    }
+                }
+            }
+            
+            // Move up to the parent directory
+            if let Some(parent) = current_path.parent() {
+                current_path = parent.to_path_buf();
+            } else {
+                // No more parents to check
+                break;
+            }
+        }
+        
+        // No suitable project root found
+        None
+    }
 
     /// Forces doc indexing for the given project
     pub async fn force_index_docs(&self, project: &PathBuf) -> Result<()> {

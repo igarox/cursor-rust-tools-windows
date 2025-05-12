@@ -76,27 +76,53 @@ pub async fn get_info_from_request(
     tracing::debug!("Processing file path: {}", file);
     let absolute_path = PathBuf::from(file.clone());
     
-    // Try to use dunce to get a canonical path without UNC prefixes
-    #[cfg(windows)]
-    let absolute_path = dunce::canonicalize(&absolute_path)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to canonicalize path: {}, error: {}", file, e);
-            absolute_path
-        });
-    
-    let Some(project) = context.get_project_by_path(&absolute_path).await else {
+    // Try to check if path exists first before canonicalization
+    if !absolute_path.exists() {
+        tracing::warn!("Path does not exist: {}", file);
+        // For external projects, create a more helpful error message
         #[cfg(windows)]
-        {
-            // Windows-specific error with helpful information
-            tracing::error!("Path format issue on Windows: {}", file);
-            return Err(error_response(&format!(
-                "No project found for file {}. On Windows, try using forward slashes in paths.",
-                file
-            )));
-        }
+        return Err(error_response(&format!(
+            "Path does not exist: {}. Please ensure the file exists and try both forward and backslashes if needed.",
+            file
+        )));
         
         #[cfg(not(windows))]
-        return Err(error_response(&format!("No project found for file {}", file)));
+        return Err(error_response(&format!("Path does not exist: {}", file)));
+    }
+    
+    // Try to use dunce to get a canonical path without UNC prefixes
+    #[cfg(windows)]
+    let absolute_path = match dunce::canonicalize(&absolute_path) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("Failed to canonicalize path: {}, error: {}", file, e);
+            // Try a fallback approach - use the original path
+            absolute_path
+        }
+    };
+    
+    // Try to get the project context, with better error handling
+    let project = match context.get_project_by_path(&absolute_path).await {
+        Some(project) => project,
+        None => {
+            // If standard project lookup fails, try to register this as an external project
+            if let Some(project) = context.get_or_register_external_project(&absolute_path).await {
+                project
+            } else {
+                #[cfg(windows)]
+                {
+                    // Windows-specific error with helpful information
+                    tracing::error!("Path format issue on Windows: {}", file);
+                    return Err(error_response(&format!(
+                        "No project found for file {}. On Windows, try using forward slashes in paths or ensure the project is properly registered.",
+                        file
+                    )));
+                }
+                
+                #[cfg(not(windows))]
+                return Err(error_response(&format!("No project found for file {}", file)));
+            }
+        }
     };
 
     let relative_path = match project.project.relative_path(&file) {
@@ -105,10 +131,16 @@ pub async fn get_info_from_request(
             #[cfg(windows)]
             {
                 tracing::error!("Windows path resolution error: {}", e);
-                return Err(error_response(&format!(
-                    "{}. Windows paths may need normalization. Try using forward slashes.",
-                    e
-                )));
+                // Try a different approach by using the file name only
+                if let Some(file_name) = Path::new(&file).file_name() {
+                    tracing::debug!("Falling back to just using file name: {:?}", file_name);
+                    file_name.to_string_lossy().to_string()
+                } else {
+                    return Err(error_response(&format!(
+                        "{}. Windows paths may need normalization. Try using forward slashes.",
+                        e
+                    )));
+                }
             }
             
             #[cfg(not(windows))]

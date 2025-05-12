@@ -89,14 +89,33 @@ async fn handle_request(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let messages = project
-        .cargo_remote
-        .check(only_errors)
-        .await
-        .map_err(|e| error_response(&format!("{e:?}")))?;
+    let project_root = project.project.root().to_string_lossy();
+    tracing::info!("Attempting cargo check on project at: {}", project_root);
+    
+    let messages = match project.cargo_remote.check(only_errors).await {
+        Ok(messages) => messages,
+        Err(e) => {
+            tracing::error!("Cargo check failed: {:?}", e);
+            
+            #[cfg(windows)]
+            let error_message = format!(
+                "Cargo check failed: {:?}. This could be due to path resolution issues on Windows. \
+                 Please ensure the project is properly registered and the path is accessible.", e
+            );
+            
+            #[cfg(not(windows))]
+            let error_message = format!("Cargo check failed: {:?}", e);
+            
+            return Err(error_response(&error_message));
+        }
+    };
 
-    let response_message =
-        serde_json::to_string_pretty(&messages).map_err(|e| error_response(&format!("{e:?}")))?;
+    let response_message = match serde_json::to_string_pretty(&messages) {
+        Ok(message) => message,
+        Err(e) => {
+            return Err(error_response(&format!("Failed to serialize cargo check results: {:?}", e)));
+        }
+    };
 
     Ok(CallToolResponse {
         content: vec![ToolResponseContent::Text {
